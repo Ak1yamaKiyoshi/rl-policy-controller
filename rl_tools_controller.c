@@ -16,7 +16,7 @@
 #include "pm.h"
 #include "task.h"
 
-#define CONTROL_INTERVAL_MS 10
+#define CONTROL_INTERVAL_MS 2
 #define CONTROL_INTERVAL_US (CONTROL_INTERVAL_MS * 1000)
 #define CONTROL_PACKET_TIMEOUT_USEC (1000*200)
 #define BEHIND_SCHEDULE_MESSAGE_MIN_INTERVAL (1000000)
@@ -113,7 +113,6 @@ static uint8_t set_motors_overwrite = 0;
 static uint16_t motor_cmd[4];
 static float motor_cmd_divider, motor_cmd_divider_warmup;
 static bool prev_set_motors, prev_pre_set_motors;
-static uint8_t use_pre_set_warmup;
 
 static motors_thrust_uncapped_t motorThrustUncapped;
 static motors_thrust_uncapped_t motorThrustBatCompUncapped;
@@ -202,7 +201,6 @@ void controllerOutOfTreeInit(void){
   controller_tick = 0;
   motor_cmd_divider = 1.0;
   motor_cmd_divider_warmup = 7.0;
-
   motor_cmd[0] = 0;
   motor_cmd[1] = 0;
   motor_cmd[2] = 0;
@@ -210,7 +208,6 @@ void controllerOutOfTreeInit(void){
   timestamp_last_reset = usecTimestamp();
   prev_set_motors = false;
   prev_pre_set_motors = false;
-  use_pre_set_warmup = 0;
   timestamp_last_control_packet_received = 0;
   timestamp_last_control_packet_received_hover = 0;
   timestamp_last_behind_schedule_message = 0;
@@ -242,8 +239,8 @@ void controllerOutOfTreeInit(void){
   // mode = NORMAL;
   mode = POSITION;
   // mode = FIGURE_EIGHT;
-  trigger_mode = RL_TOOLS_PACKET;
-  // trigger_mode = HOVER_PACKET;
+  // trigger_mode = RL_TOOLS_PACKET;
+  trigger_mode = HOVER_PACKET;
   use_orig_controller = 0;
   waypoint_navigation_dynamic_current_waypoint = 0;
   waypoint_navigation_dynamic_threshold = 0;
@@ -346,7 +343,15 @@ static void print_mode(stab_mode_t mode){
   }
 }
 
-void controllerOutOfTree(control_t *control, setpoint_t *setpoint, const sensorData_t *sensors, const state_t *state, const uint32_t tick) {
+void controllerOutOfTree(
+  control_t *control, 
+  setpoint_t *setpoint, 
+  const sensorData_t *sensors,
+  const state_t *state,
+  const uint32_t tick,
+  float vx,
+  float vy)
+{
   uint64_t now = usecTimestamp();
   if(setpoint->mode.x == modeVelocity && setpoint->mode.y == modeVelocity){
     timestamp_last_control_packet_received_hover = now;
@@ -364,7 +369,7 @@ void controllerOutOfTree(control_t *control, setpoint_t *setpoint, const sensorD
   if(!prev_pre_set_motors && pre_set_motors){
     timestamp_pre_set_motors = now;
   }
-  set_motors = pre_set_motors && (((now - timestamp_pre_set_motors) > WARMUP_TIME) || use_pre_set_warmup == 0);
+  set_motors = pre_set_motors && (((now - timestamp_pre_set_motors) > WARMUP_TIME) || trigger_mode == RL_TOOLS_PACKET);
 
   log_set_motors = set_motors ? 1 : 0;
   // set_rl_tools_overwrite_stabilizer(set_motors);
@@ -460,9 +465,57 @@ void controllerOutOfTree(control_t *control, setpoint_t *setpoint, const sensorD
       }
     break;
     case POSITION:
-      target_pos[0] = origin[0];
-      target_pos[1] = origin[1];
-      target_pos[2] = origin[2];
+      switch(setpoint->mode.x){
+        case modeAbs:
+        target_pos[0] = setpoint->position.x;
+        target_vel[0] = 0;
+        break;
+        case modeVelocity:
+        target_pos[0] = state->position.x - setpoint->velocity.x * velocity_cmd_p_term;
+        target_vel[0] = setpoint->velocity.x * velocity_cmd_multiplier;
+        break;
+        case modeDisable:
+        target_pos[0] = origin[0];
+        target_vel[0] = 0;
+        break;
+      }
+      switch(setpoint->mode.y){
+        case modeAbs:
+        target_pos[1] = setpoint->position.y;
+        target_vel[1] = 0;
+        break;
+        case modeVelocity:
+        target_pos[1] = state->position.y - setpoint->velocity.y * velocity_cmd_p_term;
+        target_vel[1] = setpoint->velocity.y * velocity_cmd_multiplier;
+        break;
+        case modeDisable:
+        target_pos[1] = origin[1];
+        target_vel[1] = 0;
+        break;
+      }
+      switch(setpoint->mode.z){
+        case modeAbs:
+        target_pos[2] = setpoint->position.z;
+        target_vel[2] = 0;
+        break;
+        case modeVelocity:
+        target_pos[2] = state->position.z - setpoint->velocity.z * velocity_cmd_p_term;
+        target_vel[2] = setpoint->velocity.z * velocity_cmd_multiplier;
+        break;
+        case modeDisable:
+        target_pos[2] = origin[2];
+        target_vel[2] = 0;
+        break;
+      }
+
+      //target_pos[0] = setpoint->position.x;//origin[0];
+      //target_pos[1] = setpoint->position.y;//origin[1];
+      //target_pos[2] = setpoint->position.z;//origin[2];
+
+      //target_vel[0] = setpoint->velocity.x;
+      //target_vel[1] = setpoint->velocity.y;
+      //target_vel[2] = setpoint->velocity.z;
+
       break;
     case WAYPOINT_NAVIGATION:
     {
@@ -536,7 +589,7 @@ void controllerOutOfTree(control_t *control, setpoint_t *setpoint, const sensorD
       }
     }
     for(uint8_t i=0; i<4; i++){
-      if (tick % (CONTROL_INTERVAL_MS * 1000) == 0){
+      if (tick % (CONTROL_INTERVAL_MS * 10000) == 0){
         DEBUG_PRINT("action_output[%d]: %f\n", i, action_output[i]);
       }
       float a_pp = (action_output[i] + 1)/2;
@@ -640,7 +693,6 @@ void controllerOutOfTree(control_t *control, setpoint_t *setpoint, const sensorD
 
 PARAM_GROUP_START(rlt)
 PARAM_ADD(PARAM_UINT8, trigger, &trigger_mode)
-PARAM_ADD(PARAM_UINT8, motor_warmup, &use_pre_set_warmup)
 PARAM_ADD(PARAM_FLOAT, motor_div, &motor_cmd_divider)
 PARAM_ADD(PARAM_FLOAT, motor_div_wu, &motor_cmd_divider_warmup)
 PARAM_ADD(PARAM_FLOAT, target_z, &target_height)
